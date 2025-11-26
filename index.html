@@ -1,0 +1,1184 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>无限扫雷</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #f0f0f0;
+            font-family: Arial, sans-serif;
+        }
+
+        #gameCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            cursor: grab;
+        }
+
+        #gameCanvas:active {
+            cursor: grabbing;
+        }
+
+        #info {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(255, 255, 255, 0.8);
+            padding: 8px;
+            border-radius: 5px;
+            font-size: 14px;
+            z-index: 100;
+            pointer-events: none;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+
+        #controls {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background-color: rgba(255, 255, 255, 0.8);
+            padding: 8px;
+            border-radius: 5px;
+            font-size: 14px;
+            z-index: 100;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+
+        #controls button {
+            margin: 0 5px;
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+
+        .active {
+            background-color: #4CAF50;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<div id="info">缩放: 1.00x | 位置: (0, 0) | 鼠标: (0, 0)</div>
+<div id="controls">
+    <button id="digBtn" class="active">挖掘</button>
+    <button id="flagBtn">标记</button>
+    <button id="autoBtn">自动</button>
+    <button id="resetBtn">重置游戏</button>
+</div>
+
+<script>
+    // ==================== 常量定义 ====================
+    const CELL_SIZE_MAX = 30; // 最大网格尺寸 (px)
+    const CHUNK_SIZE = 32;    // 每个区块的网格数量
+    const CHUNK_PIXEL_SIZE = CELL_SIZE_MAX * CHUNK_SIZE; // 区块最大像素尺寸
+    const MIN_ZOOM = 0.05;    // 最小缩放级别
+    const MAX_ZOOM = 1.0;     // 最大缩放级别
+    const CROSSHATCH_ZOOM_THRESHOLD = 0.3; // 显示交叉花纹的缩放阈值
+    const MINE_CHANCE = 0.15; // 地雷生成概率
+    const MAX_MAP_BLOCK_ZOOM = 0.4;
+    const MINE_SECRET_KEY = "InfiniteMineSweeper2023"; // 用于确定性地雷生成的密钥
+    const STORAGE_KEY = "infiniteMineSweeper"; // 本地存储键
+
+    // ==================== 游戏状态 ====================
+    const state = {
+        camera: {
+            x: 0,
+            y: 0,
+            zoom: 0.5
+        },
+        mouse: {
+            x: 0,
+            y: 0,
+            worldX: 0,
+            worldY: 0,
+            down: false,
+            lastX: 0,
+            lastY: 0,
+            isDragging: false
+        },
+        game: {
+            chunks: new Map(), // 存储已操作的区块
+            mode: "dig", // 当前操作模式: dig/flag
+            explosionQueue: [], // 爆炸连锁反应队列
+            processingExplosions: false, // 是否正在处理爆炸
+            autoPlay: false, // 是否启用自动游戏
+            pendingActions: [] // 待处理的操作队列
+        },
+        fps: {
+            value: 0,
+            lastUpdate: Date.now(),
+            updateTimes: 0,
+            lastFrameTime: 0,
+        },
+    };
+
+    // ==================== 细胞状态 ====================
+    // 0-8: 周围的地雷数
+    // -1: 未操作
+    // -2: 已标记
+    // -3: 有地雷且未操作
+    // -4: 有地雷且已标记
+    // -5: 爆炸的地雷
+
+    // ==================== DOM元素 ====================
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const infoEl = document.getElementById('info');
+    const digBtn = document.getElementById('digBtn');
+    const flagBtn = document.getElementById('flagBtn');
+    const autoBtn = document.getElementById('autoBtn');
+    const resetBtn = document.getElementById('resetBtn');
+
+    // ==================== 初始化 ====================
+    function init() {
+        resizeCanvas();
+        loadGame();
+
+        // 事件监听
+        window.addEventListener('resize', resizeCanvas);
+        canvas.addEventListener('mousedown', handleMouseDown);
+        canvas.addEventListener('mousemove', handleMouseMove);
+        canvas.addEventListener('mouseup', handleMouseUp);
+        canvas.addEventListener('wheel', handleMouseWheel);
+        canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+        // 按钮事件
+        digBtn.addEventListener('click', () => setGameMode('dig'));
+        flagBtn.addEventListener('click', () => setGameMode('flag'));
+        autoBtn.addEventListener('click', toggleAutoPlay);
+        resetBtn.addEventListener('click', resetGame);
+
+        // 开始游戏循环
+        requestAnimationFrame(gameLoop);
+    }
+
+    // 设置游戏模式
+    function setGameMode(mode) {
+        state.game.mode = mode;
+        digBtn.classList.toggle('active', mode === 'dig');
+        flagBtn.classList.toggle('active', mode === 'flag');
+    }
+
+    // 调整Canvas大小
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    }
+
+    const frameInterval = 1000 / 60;
+
+    // ==================== 游戏循环 ====================
+    function gameLoop(timestamp) {
+        // 计算距离上一帧的时间差
+        const deltaTime = timestamp - state.fps.lastFrameTime;
+
+        // 只有当时间差大于设定间隔时才更新和渲染
+        if (deltaTime > frameInterval) {
+            state.fps.lastFrameTime = timestamp - (deltaTime % frameInterval);
+            update();
+            render();
+            state.fps.updateTimes++;
+            if (Date.now() - state.fps.lastUpdate > 1000) {
+                state.fps.value = state.fps.updateTimes;
+                state.fps.lastUpdate = Date.now();
+                state.fps.updateTimes = 0; // 重置计数器
+            }
+        }
+
+        requestAnimationFrame(gameLoop);
+    }
+
+    function update() {
+        updateMouseWorldPosition();
+        updateInfo();
+        autoPlay();
+    }
+
+    // ==================== 更新逻辑 ====================
+    function updateMouseWorldPosition() {
+        state.mouse.worldX = (state.mouse.x - canvas.width / 2) / state.camera.zoom + state.camera.x;
+        state.mouse.worldY = (state.mouse.y - canvas.height / 2) / state.camera.zoom + state.camera.y;
+    }
+
+    function updateInfo() {
+        // 计算格子坐标
+        const cellX = Math.floor(state.mouse.worldX / CELL_SIZE_MAX);
+        const cellY = Math.floor(state.mouse.worldY / CELL_SIZE_MAX);
+
+        // 计算区块坐标
+        const chunkX = Math.floor(cellX / CHUNK_SIZE);
+        const chunkY = Math.floor(cellY / CHUNK_SIZE);
+
+        infoEl.textContent = `缩放: ${state.camera.zoom.toFixed(2)}x | ` +
+            `位置: (${Math.round(state.camera.x)}, ${Math.round(state.camera.y)}) | ` +
+            `鼠标: (${cellX}, ${cellY}) | ` +
+            `区块: (${chunkX}, ${chunkY}) | ` +
+            `模式: ${state.game.mode === 'dig' ? '挖掘' : '标记'} | FPS: ${state.fps.value}`;
+    }
+
+    // ==================== 渲染 ====================
+    function render() {
+        // 清除画布
+        ctx.fillStyle = '#f0f0f0';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // 应用相机变换
+        ctx.save();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.scale(state.camera.zoom, state.camera.zoom);
+        ctx.translate(-state.camera.x, -state.camera.y);
+
+        // 绘制可见区块
+        renderVisibleChunks();
+
+        // 还原画布状态
+        ctx.restore();
+    }
+
+    // 渲染可见区块
+    function renderVisibleChunks() {
+        // 计算可见区域的边界（以区块为单位）
+        const visibleWidth = canvas.width / state.camera.zoom;
+        const visibleHeight = canvas.height / state.camera.zoom;
+
+        const minChunkX = Math.floor((state.camera.x - visibleWidth / 2) / CHUNK_PIXEL_SIZE);
+        const maxChunkX = Math.ceil((state.camera.x + visibleWidth / 2) / CHUNK_PIXEL_SIZE);
+        const minChunkY = Math.floor((state.camera.y - visibleHeight / 2) / CHUNK_PIXEL_SIZE);
+        const maxChunkY = Math.ceil((state.camera.y + visibleHeight / 2) / CHUNK_PIXEL_SIZE);
+
+        // 绘制可见区块
+        for (let chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (let chunkY = minChunkY; chunkY <= maxChunkY; chunkY++) {
+                renderChunk(chunkX, chunkY);
+            }
+        }
+    }
+
+    // 渲染单个区块
+    function renderChunk(chunkX, chunkY) {
+        const chunkKey = `${chunkX},${chunkY}`;
+        const chunkStartX = chunkX * CHUNK_PIXEL_SIZE;
+        const chunkStartY = chunkY * CHUNK_PIXEL_SIZE;
+
+        // 绘制区块背景
+        ctx.fillStyle = getChunkColor(chunkX, chunkY);
+        ctx.fillRect(chunkStartX, chunkStartY, CHUNK_PIXEL_SIZE, CHUNK_PIXEL_SIZE);
+
+        // 获取或生成区块数据
+        let chunkData = state.game.chunks.get(chunkKey);
+
+        // 如果还没有加载区块数据，则尝试从localStorage加载
+        if (!chunkData) {
+            chunkData = loadChunk(chunkKey);
+        }
+
+        // 绘制区块中的每个格子
+        if (state.camera.zoom >= MAX_MAP_BLOCK_ZOOM) {
+            for (let x = 0; x < CHUNK_SIZE; x++) {
+                for (let y = 0; y < CHUNK_SIZE; y++) {
+                    const cellX = chunkX * CHUNK_SIZE + x;
+                    const cellY = chunkY * CHUNK_SIZE + y;
+
+                    // 绘制格子内容
+                    const cellState = getCellState(chunkData, x, y, cellX, cellY);
+                    const pixelX = chunkStartX + x * CELL_SIZE_MAX;
+                    const pixelY = chunkStartY + y * CELL_SIZE_MAX;
+
+                    renderCell(pixelX, pixelY, CELL_SIZE_MAX, cellState);
+                }
+            }
+
+            // 绘制网格线
+            ctx.strokeStyle = 'rgba(0,0,0,0.2)';
+            ctx.lineWidth = 0.5 / state.camera.zoom;
+
+            // 绘制横向网格线
+            for (let y = 0; y <= CHUNK_SIZE; y++) {
+                const lineY = chunkStartY + y * CELL_SIZE_MAX;
+                ctx.beginPath();
+                ctx.moveTo(chunkStartX, lineY);
+                ctx.lineTo(chunkStartX + CHUNK_PIXEL_SIZE, lineY);
+                ctx.stroke();
+            }
+
+            // 绘制纵向网格线
+            for (let x = 0; x <= CHUNK_SIZE; x++) {
+                const lineX = chunkStartX + x * CELL_SIZE_MAX;
+                ctx.beginPath();
+                ctx.moveTo(lineX, chunkStartY);
+                ctx.lineTo(lineX, chunkStartY + CHUNK_PIXEL_SIZE);
+                ctx.stroke();
+            }
+        } else if (chunkData) {
+            // 如果缩放较小但区块已操作，显示概览信息
+            renderChunkOverview(chunkStartX, chunkStartY, chunkData);
+        }
+
+        // 绘制区块边界
+        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+        ctx.lineWidth = 1 / state.camera.zoom;
+        ctx.strokeRect(chunkStartX, chunkStartY, CHUNK_PIXEL_SIZE, CHUNK_PIXEL_SIZE);
+
+        // 如果缩放较小，显示区块坐标
+        if (state.camera.zoom <= 0.4) {
+            ctx.fillStyle = 'rgba(0,0,0,0.7)';
+            ctx.font = `${20 / state.camera.zoom}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(`(${chunkX}, ${chunkY})`,
+                chunkStartX + CHUNK_PIXEL_SIZE / 2,
+                chunkStartY + CHUNK_PIXEL_SIZE / 2);
+        }
+    }
+
+    // 绘制区块概览（缩放较小时显示）
+    function renderChunkOverview(x, y, chunkData) {
+        // 检查区块是否已有操作
+        let hasAction = false;
+        let hasMines = false;
+        for (let data of Object.values(chunkData)) {
+            if (data !== -1 && data !== -3) {
+                hasAction = true;
+                if (data === -4 || data === -5) {
+                    hasMines = true;
+                }
+            }
+        }
+
+        if (hasAction) {
+            // 绘制概览指示器
+            ctx.fillStyle = hasMines ? 'rgba(255,0,0,0.3)' : 'rgba(0,255,0,0.3)';
+            ctx.fillRect(x + 4, y + 4, CHUNK_PIXEL_SIZE - 8, CHUNK_PIXEL_SIZE - 8);
+        }
+    }
+
+    // 绘制单个格子
+    function renderCell(x, y, size, state) {
+        // 未操作状态
+        if (state === -1 || state === -3) {
+            ctx.fillStyle = '#bdbdbd';
+            ctx.fillRect(x, y, size, size);
+
+            // 添加阴影效果
+            ctx.fillStyle = '#a1a1a1';
+            ctx.fillRect(x, y + size - 2, size, 2);
+            ctx.fillRect(x + size - 2, y, 2, size);
+
+            ctx.fillStyle = '#e0e0e0';
+            ctx.fillRect(x, y, size, 2);
+            ctx.fillRect(x, y, 2, size);
+
+            return;
+        }
+
+        // 已标记
+        if (state === -2 || state === -4) {
+            // 绘制未操作背景
+            ctx.fillStyle = '#bdbdbd';
+            ctx.fillRect(x, y, size, size);
+
+            // 添加阴影效果
+            ctx.fillStyle = '#a1a1a1';
+            ctx.fillRect(x, y + size - 2, size, 2);
+            ctx.fillRect(x + size - 2, y, 2, size);
+
+            ctx.fillStyle = '#e0e0e0';
+            ctx.fillRect(x, y, size, 2);
+            ctx.fillRect(x, y, 2, size);
+
+            // 绘制旗帜
+            const flagSize = size * 0.6;
+            const flagX = x + size / 2 - flagSize / 4;
+            const flagY = y + size / 2 - flagSize / 2;
+
+            // 旗杆
+            ctx.fillStyle = '#222';
+            ctx.fillRect(flagX, flagY, 2, flagSize);
+
+            // 旗帜
+            ctx.fillStyle = '#f44336';
+            ctx.beginPath();
+            ctx.moveTo(flagX + 2, flagY);
+            ctx.lineTo(flagX + 2 + flagSize / 2, flagY + flagSize / 4);
+            ctx.lineTo(flagX + 2, flagY + flagSize / 2);
+            ctx.fill();
+
+            // 底座
+            ctx.fillStyle = '#222';
+            ctx.fillRect(flagX - 2, flagY + flagSize - 2, 6, 2);
+
+            return;
+        }
+
+        // 爆炸的地雷
+        if (state === -5) {
+            ctx.fillStyle = '#f44336';
+            ctx.fillRect(x, y, size, size);
+
+            // 绘制地雷
+            const mineSize = size * 0.5;
+            ctx.fillStyle = '#000';
+            ctx.beginPath();
+            ctx.arc(x + size / 2, y + size / 2, mineSize / 2, 0, Math.PI * 2);
+            ctx.fill();
+
+            // 绘制地雷尖刺
+            const centerX = x + size / 2;
+            const centerY = y + size / 2;
+            const spikeLength = size * 0.2;
+
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 2;
+            for (let angle = 0; angle < Math.PI * 2; angle += Math.PI / 4) {
+                const startX = centerX + Math.cos(angle) * (mineSize / 2);
+                const startY = centerY + Math.sin(angle) * (mineSize / 2);
+                const endX = centerX + Math.cos(angle) * (mineSize / 2 + spikeLength);
+                const endY = centerY + Math.sin(angle) * (mineSize / 2 + spikeLength);
+
+                ctx.beginPath();
+                ctx.moveTo(startX, startY);
+                ctx.lineTo(endX, endY);
+                ctx.stroke();
+            }
+
+            // 绘制反光
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.arc(centerX - mineSize / 5, centerY - mineSize / 5, mineSize / 8, 0, Math.PI * 2);
+            ctx.fill();
+
+            return;
+        }
+
+        // 已挖掘但没有地雷 (显示数字0-8)
+        ctx.fillStyle = '#e0e0e0';
+        ctx.fillRect(x, y, size, size);
+
+        // 如果周围有地雷，显示数字
+        if (state > 0) {
+            const colors = [
+                '', // 不使用索引0
+                '#2196F3', // 1: 蓝色
+                '#4CAF50', // 2: 绿色
+                '#F44336', // 3: 红色
+                '#673AB7', // 4: 紫色
+                '#FF5722', // 5: 橙色
+                '#00BCD4', // 6: 青色
+                '#9C27B0', // 7: 洋红色
+                '#FF9800'  // 8: 橙黄色
+            ];
+
+            ctx.fillStyle = colors[state];
+            ctx.font = `bold ${Math.floor(size * 0.7)}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(state.toString(), x + size / 2, y + size / 2);
+        }
+    }
+
+    // 获取区块颜色
+    function getChunkColor(chunkX, chunkY) {
+        // 基础颜色
+        const baseColor = '#ffffff';
+
+        // 如果缩放小于阈值，使用交叉花纹区分
+        if (state.camera.zoom < CROSSHATCH_ZOOM_THRESHOLD) {
+            // 棋盘格模式
+            if ((chunkX + chunkY) % 2 === 0) {
+                return baseColor;
+            } else {
+                return '#f8f8f8';
+            }
+        }
+
+        return baseColor;
+    }
+
+    // ==================== 游戏逻辑 ====================
+    // 获取格子状态
+    function getCellState(chunkData, localX, localY, globalX, globalY) {
+        // 如果区块没有数据，表示未操作过
+        if (!chunkData) {
+            // 检查是否有地雷
+            return hasMine(globalX, globalY) ? -3 : -1;
+        }
+
+        const cellKey = `${localX},${localY}`;
+
+        // 如果格子没有数据，也是未操作过
+        if (!(cellKey in chunkData)) {
+            return hasMine(globalX, globalY) ? -3 : -1;
+        }
+
+        return chunkData[cellKey];
+    }
+
+    // 使用坐标哈希确定是否有地雷
+    function hasMine(x, y) {
+        // 使用坐标和密钥生成哈希
+        const hash = cyrb53(`${x},${y},${MINE_SECRET_KEY}`);
+        // 确定性地决定是否放置地雷
+        return (hash % 1000) / 1000 < MINE_CHANCE;
+    }
+
+    // 快速哈希函数
+    function cyrb53(str, seed = 0) {
+        let h1 = 0xdeadbeef ^ seed, h2 = 0x41c6ce57 ^ seed;
+        for (let i = 0, ch; i < str.length; i++) {
+            ch = str.charCodeAt(i);
+            h1 = Math.imul(h1 ^ ch, 2654435761);
+            h2 = Math.imul(h2 ^ ch, 1597334677);
+        }
+        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+        h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+        h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+
+        return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+    }
+
+    // 操作格子
+    function interactWithCell(globalX, globalY) {
+        if (state.camera.zoom < MAX_MAP_BLOCK_ZOOM) {
+            return;
+        }
+        const chunkX = Math.floor(globalX / CHUNK_SIZE);
+        const chunkY = Math.floor(globalY / CHUNK_SIZE);
+        const localX = ((globalX % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+        const localY = ((globalY % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+
+        const chunkKey = `${chunkX},${chunkY}`;
+        const cellKey = `${localX},${localY}`;
+
+        // 获取或创建区块数据
+        let chunkData = state.game.chunks.get(chunkKey) || {};
+
+        // 获取当前格子状态
+        const currentState = getCellState(chunkData, localX, localY, globalX, globalY);
+
+        // 根据当前模式和格子状态执行操作
+        if (state.game.mode === 'dig') {
+            // 挖掘模式
+            if (currentState === -1) {
+                // 挖掘空格
+                revealCell(globalX, globalY);
+            } else if (currentState === -3) {
+                // 挖到地雷
+                chunkData[cellKey] = -5; // 设置为爆炸状态
+                state.game.chunks.set(chunkKey, chunkData);
+                saveChunk(chunkKey);
+
+                // 触发爆炸连锁反应
+                triggerExplosion(globalX, globalY);
+            } else if (currentState >= 1 && currentState <= 8) {
+                // 点击数字，检查是否可以自动清除周围
+                checkNumberReveal(globalX, globalY);
+            }
+            // 已标记的格子在挖掘模式下不做操作
+        } else if (state.game.mode === 'flag') {
+            // 标记模式
+            if (currentState === -1) {
+                // 标记空格
+                chunkData[cellKey] = -2;
+                state.game.chunks.set(chunkKey, chunkData);
+                saveChunk(chunkKey);
+            } else if (currentState === -3) {
+                // 标记地雷
+                chunkData[cellKey] = -4;
+                state.game.chunks.set(chunkKey, chunkData);
+                saveChunk(chunkKey);
+            } else if (currentState === -2 || currentState === -4) {
+                // 取消标记
+                chunkData[cellKey] = hasMine(globalX, globalY) ? -3 : -1;
+                state.game.chunks.set(chunkKey, chunkData);
+                saveChunk(chunkKey);
+            }
+            // 已挖掘的格子在标记模式下不做操作
+        }
+    }
+
+    // 揭示格子
+    function revealCell(globalX, globalY) {
+        const chunkX = Math.floor(globalX / CHUNK_SIZE);
+        const chunkY = Math.floor(globalY / CHUNK_SIZE);
+        const localX = ((globalX % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+        const localY = ((globalY % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+
+        const chunkKey = `${chunkX},${chunkY}`;
+        const cellKey = `${localX},${localY}`;
+
+        // 获取或创建区块数据
+        let chunkData = state.game.chunks.get(chunkKey) || {};
+
+        // 获取当前格子状态
+        const currentState = getCellState(chunkData, localX, localY, globalX, globalY);
+
+        // 如果已经操作过或有标记，不做任何处理
+        if (currentState !== -1 && currentState !== -3) {
+            return;
+        }
+
+        // 如果是地雷，引爆
+        if (currentState === -3) {
+            chunkData[cellKey] = -5; // 爆炸状态
+            state.game.chunks.set(chunkKey, chunkData);
+            saveChunk(chunkKey);
+
+            // 触发爆炸连锁反应
+            triggerExplosion(globalX, globalY);
+            return;
+        }
+
+        // 计算周围地雷数
+        const mineCount = countSurroundingMines(globalX, globalY);
+
+        // 更新格子状态
+        chunkData[cellKey] = mineCount;
+        state.game.chunks.set(chunkKey, chunkData);
+        saveChunk(chunkKey);
+
+        // 如果周围没有地雷，自动揭示周围的格子
+        if (mineCount === 0) {
+            // 遍历周围8个格子
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    if (dx === 0 && dy === 0) continue;
+
+                    const nextX = globalX + dx;
+                    const nextY = globalY + dy;
+
+                    // 递归揭示
+                    revealCell(nextX, nextY);
+                }
+            }
+        }
+    }
+
+    // 计算周围地雷数
+    function countSurroundingMines(globalX, globalY) {
+        let count = 0;
+
+        // 遍历周围8个格子
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                if (dx === 0 && dy === 0) continue;
+
+                const nextX = globalX + dx;
+                const nextY = globalY + dy;
+
+                // 检查是否有地雷
+                if (hasMine(nextX, nextY)) {
+                    count++;
+                }
+            }
+        }
+
+        return count;
+    }
+
+    // 触发爆炸连锁反应
+    function triggerExplosion(globalX, globalY) {
+        // 将初始爆炸点加入队列
+        state.game.explosionQueue.push({x: globalX, y: globalY});
+
+        // 如果没有正在处理爆炸，开始处理
+        if (!state.game.processingExplosions) {
+            state.game.processingExplosions = true;
+            processNextExplosion();
+        }
+    }
+
+    // 处理爆炸队列中的下一个爆炸
+    function processNextExplosion() {
+        if (state.game.explosionQueue.length === 0) {
+            state.game.processingExplosions = false;
+            return;
+        }
+
+        // 取出队列中的第一个爆炸点
+        const {x, y} = state.game.explosionQueue.shift();
+
+        // 延迟100ms，以产生连锁爆炸的视觉效果
+        setTimeout(() => {
+            // 遍历5x5区域
+            for (let dx = -2; dx <= 2; dx++) {
+                for (let dy = -2; dy <= 2; dy++) {
+                    const nextX = x + dx;
+                    const nextY = y + dy;
+
+                    // 计算区块和本地坐标
+                    const chunkX = Math.floor(nextX / CHUNK_SIZE);
+                    const chunkY = Math.floor(nextY / CHUNK_SIZE);
+                    const localX = ((nextX % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+                    const localY = ((nextY % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+
+                    const chunkKey = `${chunkX},${chunkY}`;
+                    const cellKey = `${localX},${localY}`;
+
+                    // 获取或创建区块数据
+                    let chunkData = state.game.chunks.get(chunkKey) || {};
+
+                    // 获取当前格子状态
+                    const currentState = getCellState(chunkData, localX, localY, nextX, nextY);
+
+                    // 如果是未标记的地雷，引爆它
+                    if (currentState === -3) {
+                        chunkData[cellKey] = -5; // 爆炸状态
+                        state.game.chunks.set(chunkKey, chunkData);
+                        saveChunk(chunkKey);
+
+                        // 将这个新的爆炸点加入队列
+                        state.game.explosionQueue.push({x: nextX, y: nextY});
+                    }
+                    // 如果是未操作的空格，揭示它
+                    else if (currentState === -1) {
+                        // 计算周围地雷数
+                        const mineCount = countSurroundingMines(nextX, nextY);
+
+                        // 更新格子状态
+                        chunkData[cellKey] = mineCount;
+                        state.game.chunks.set(chunkKey, chunkData);
+                        saveChunk(chunkKey);
+
+                        // 如果周围没有地雷，自动揭示周围的格子
+                        if (mineCount === 0) {
+                            // 遍历周围8个格子
+                            for (let dx2 = -1; dx2 <= 1; dx2++) {
+                                for (let dy2 = -1; dy2 <= 1; dy2++) {
+                                    if (dx2 === 0 && dy2 === 0) continue;
+
+                                    const nextX2 = nextX + dx2;
+                                    const nextY2 = nextY + dy2;
+
+                                    // 检查是否是未操作的格子
+                                    const chunkX2 = Math.floor(nextX2 / CHUNK_SIZE);
+                                    const chunkY2 = Math.floor(nextY2 / CHUNK_SIZE);
+                                    const localX2 = ((nextX2 % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+                                    const localY2 = ((nextY2 % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+
+                                    const chunkKey2 = `${chunkX2},${chunkY2}`;
+                                    const cellKey2 = `${localX2},${localY2}`;
+
+                                    const chunkData2 = state.game.chunks.get(chunkKey2) || {};
+                                    const cellState2 = getCellState(chunkData2, localX2, localY2, nextX2, nextY2);
+
+                                    if (cellState2 === -1 || cellState2 === -3) {
+                                        // 递归揭示
+                                        revealCell(nextX2, nextY2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 处理下一个爆炸
+            processNextExplosion();
+        }, 100);
+    }
+
+    // 检查数字点击自动清除
+    function checkNumberReveal(globalX, globalY) {
+        const chunkX = Math.floor(globalX / CHUNK_SIZE);
+        const chunkY = Math.floor(globalY / CHUNK_SIZE);
+        const localX = ((globalX % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+        const localY = ((globalY % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+
+        const chunkKey = `${chunkX},${chunkY}`;
+        const chunkData = state.game.chunks.get(chunkKey) || {};
+
+        // 获取格子状态
+        const cellKey = `${localX},${localY}`;
+        const mineCount = chunkData[cellKey];
+
+        // 如果不是数字，返回
+        if (typeof mineCount !== 'number' || mineCount <= 0) {
+            return;
+        }
+
+        // 计算周围已标记的格子数
+        let flaggedCount = 0;
+        let unknownCells = [];
+
+        // 遍历周围8个格子
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                if (dx === 0 && dy === 0) continue;
+
+                const nextX = globalX + dx;
+                const nextY = globalY + dy;
+
+                const nextChunkX = Math.floor(nextX / CHUNK_SIZE);
+                const nextChunkY = Math.floor(nextY / CHUNK_SIZE);
+                const nextLocalX = ((nextX % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+                const nextLocalY = ((nextY % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+
+                const nextChunkKey = `${nextChunkX},${nextChunkY}`;
+                const nextChunkData = state.game.chunks.get(nextChunkKey) || {};
+
+                const nextCellState = getCellState(nextChunkData, nextLocalX, nextLocalY, nextX, nextY);
+
+                if (nextCellState === -2 || nextCellState === -4) {
+                    flaggedCount++;
+                } else if (nextCellState === -1 || nextCellState === -3) {
+                    unknownCells.push({x: nextX, y: nextY});
+                }
+            }
+        }
+
+        // 如果已标记数量等于周围地雷数，揭示所有未标记的格子
+        if (flaggedCount === mineCount && unknownCells.length > 0) {
+            for (const cell of unknownCells) {
+                revealCell(cell.x, cell.y);
+            }
+        }
+    }
+
+    // ==================== 持久化存储 ====================
+    // 保存指定区块
+    function saveChunk(chunkKey) {
+        const chunkData = state.game.chunks.get(chunkKey);
+        if (chunkData) {
+            // 实现防抖机制，每秒最多保存一次相同的chunkKey
+            const now = Date.now();
+            if (!state.game.lastSaveTime) {
+                state.game.lastSaveTime = {};
+            }
+
+            if (!state.game.lastSaveTime[chunkKey] || now - state.game.lastSaveTime[chunkKey] >= 1000) {
+                const storageKey = `${STORAGE_KEY}_chunk_${chunkKey}`;
+                localStorage.setItem(storageKey, JSON.stringify(chunkData));
+                state.game.lastSaveTime[chunkKey] = now;
+                //console.log(`Saved chunk ${chunkKey}`);
+            }
+        }
+    }
+
+    // 加载指定区块
+    function loadChunk(chunkKey) {
+        const storageKey = `${STORAGE_KEY}_chunk_${chunkKey}`;
+        const savedChunk = localStorage.getItem(storageKey);
+        if (savedChunk) {
+            try {
+                const parsed = JSON.parse(savedChunk);
+                state.game.chunks.set(chunkKey, parsed);
+                //console.log(`load chunk ${chunkKey}`)
+                return parsed;
+            } catch (e) {
+                console.error(`Error loading chunk ${chunkKey}:`, e);
+            }
+        }
+        return null;
+    }
+
+    // 保存游戏相机状态
+    function saveGameCamera() {
+        // 保存相机状态到主键
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            cameraX: state.camera.x,
+            cameraY: state.camera.y,
+            cameraZoom: state.camera.zoom
+        }));
+    }
+
+    // 加载游戏
+    function loadGame() {
+        // 加载相机状态
+        const savedGame = localStorage.getItem(STORAGE_KEY);
+        if (savedGame) {
+            try {
+                const parsed = JSON.parse(savedGame);
+
+                // 恢复相机状态
+                if (parsed.cameraX !== undefined) state.camera.x = parsed.cameraX;
+                if (parsed.cameraY !== undefined) state.camera.y = parsed.cameraY;
+                if (parsed.cameraZoom !== undefined) state.camera.zoom = parsed.cameraZoom;
+            } catch (e) {
+                console.error("Error loading saved game:", e);
+            }
+        }
+
+        // 注意：区块数据现在按需加载，不在初始化时加载全部
+    }
+
+    // 重置游戏
+    function resetGame() {
+        if (confirm("确定要重置游戏吗？所有进度将被清除。")) {
+            // 清除游戏数据
+            state.game.chunks.clear();
+            state.game.explosionQueue = [];
+            state.game.processingExplosions = false;
+
+            // 重置相机
+            state.camera.x = 0;
+            state.camera.y = 0;
+            state.camera.zoom = 0.5;
+
+            // 清除所有存储数据
+            // 清除主键
+            localStorage.clear();
+        }
+    }
+
+    // ==================== 事件处理 ====================
+    function handleMouseDown(e) {
+        if (e.button === 0) { // 左键
+            state.mouse.down = true;
+            state.mouse.lastX = e.clientX;
+            state.mouse.lastY = e.clientY;
+            state.mouse.isDragging = false;
+        } else if (e.button === 2) { // 右键
+            e.preventDefault();
+            // 右键临时切换模式
+            const originalMode = state.game.mode;
+            state.game.mode = originalMode === 'dig' ? 'flag' : 'dig';
+
+            // 获取点击的格子
+            const cellX = Math.floor(state.mouse.worldX / CELL_SIZE_MAX);
+            const cellY = Math.floor(state.mouse.worldY / CELL_SIZE_MAX);
+            interactWithCell(cellX, cellY);
+
+            // 恢复原始模式
+            state.game.mode = originalMode;
+        }
+    }
+
+    function handleMouseMove(e) {
+        state.mouse.x = e.clientX;
+        state.mouse.y = e.clientY;
+
+        if (state.mouse.down) {
+            // 计算移动距离
+            const dx = e.clientX - state.mouse.lastX;
+            const dy = e.clientY - state.mouse.lastY;
+
+            // 如果移动超过一定距离，认为是拖动
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+                state.mouse.isDragging = true;
+            }
+
+            if (state.mouse.isDragging) {
+                // 更新相机位置
+                state.camera.x -= dx / state.camera.zoom;
+                state.camera.y -= dy / state.camera.zoom;
+
+                // 更新上一次鼠标位置
+                state.mouse.lastX = e.clientX;
+                state.mouse.lastY = e.clientY;
+            }
+        }
+    }
+
+    function handleMouseUp(e) {
+        if (e.button === 0) { // 左键
+            if (!state.mouse.isDragging) {
+                // 获取点击的格子
+                const cellX = Math.floor(state.mouse.worldX / CELL_SIZE_MAX);
+                const cellY = Math.floor(state.mouse.worldY / CELL_SIZE_MAX);
+                interactWithCell(cellX, cellY);
+            }
+
+            state.mouse.down = false;
+            state.mouse.isDragging = false;
+        }
+    }
+
+    function handleMouseWheel(e) {
+        e.preventDefault();
+
+        // 保存鼠标位置相对于相机的偏移
+        const mouseOffsetX = state.mouse.worldX - state.camera.x;
+        const mouseOffsetY = state.mouse.worldY - state.camera.y;
+
+        // 计算新的缩放值
+        const zoomDelta = -e.deltaY * 0.001;
+        const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, state.camera.zoom * (1 + zoomDelta)));
+        const zoomFactor = newZoom / state.camera.zoom;
+
+        // 更新相机缩放
+        state.camera.zoom = newZoom;
+
+        // 调整相机位置，使鼠标指向的世界坐标保持不变
+        state.camera.x = state.mouse.worldX - mouseOffsetX / zoomFactor;
+        state.camera.y = state.mouse.worldY - mouseOffsetY / zoomFactor;
+
+        // 保存游戏状态
+        saveGameCamera();
+    }
+
+    // 切换自动游戏模式
+    function toggleAutoPlay() {
+        state.game.autoPlay = !state.game.autoPlay;
+        autoBtn.classList.toggle('active', state.game.autoPlay);
+        autoBtn.textContent = state.game.autoPlay ? '停止' : '自动';
+
+        // 如果启用了自动游戏，立即开始查找操作
+        if (state.game.autoPlay) {
+            state.game.pendingActions = []; // 初始化待处理操作队列
+        }
+    }
+
+    // 自动游戏操作
+    function autoPlay() {
+        // 如果没有启用自动游戏，直接返回
+        if (!state.game.autoPlay) return;
+
+        // 如果有待处理的操作，执行其中一个
+        if (state.game.pendingActions.length > 0) {
+            const action = state.game.pendingActions.shift();
+
+            // 执行操作
+            if (action.type === 'reveal') {
+                revealCell(action.x, action.y);
+            } else if (action.type === 'flag') {
+                // 临时切换到标记模式
+                const originalMode = state.game.mode;
+                state.game.mode = 'flag';
+                interactWithCell(action.x, action.y);
+                state.game.mode = originalMode;
+            }
+            return;
+        }
+
+        // 如果没有待处理的操作，寻找新的可确认操作
+        const actions = Object.values(findAllSafeMoves());
+
+        if (actions.length > 0) {
+            // 将找到的操作添加到待处理队列
+            state.game.pendingActions = actions;
+        } else {
+            // 没有更多可确认的操作，停止自动游戏
+            state.game.autoPlay = false;
+            autoBtn.classList.remove('active');
+            autoBtn.textContent = '自动';
+        }
+    }
+
+    // 寻找所有安全的操作
+    function findAllSafeMoves() {
+        const actions = {};
+
+        // 计算可见区域的边界
+        const visibleWidth = canvas.width / state.camera.zoom;
+        const visibleHeight = canvas.height / state.camera.zoom;
+
+        const minChunkX = Math.floor((state.camera.x - visibleWidth / 2) / CHUNK_PIXEL_SIZE);
+        const maxChunkX = Math.ceil((state.camera.x + visibleWidth / 2) / CHUNK_PIXEL_SIZE);
+        const minChunkY = Math.floor((state.camera.y - visibleHeight / 2) / CHUNK_PIXEL_SIZE);
+        const maxChunkY = Math.ceil((state.camera.y + visibleHeight / 2) / CHUNK_PIXEL_SIZE);
+
+        // 遍历可见区域内的所有格子
+        for (let chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (let chunkY = minChunkY; chunkY <= maxChunkY; chunkY++) {
+                const chunkKey = `${chunkX},${chunkY}`;
+                let chunkData = state.game.chunks.get(chunkKey);
+
+                // 如果还没有加载区块数据，则尝试从localStorage加载
+                if (!chunkData) {
+                    chunkData = loadChunk(chunkKey);
+                }
+
+                // 遍历区块内的所有格子
+                for (let x = 0; x < CHUNK_SIZE; x++) {
+                    for (let y = 0; y < CHUNK_SIZE; y++) {
+                        const cellX = chunkX * CHUNK_SIZE + x;
+                        const cellY = chunkY * CHUNK_SIZE + y;
+
+                        // 获取格子状态
+                        const cellState = getCellState(chunkData, x, y, cellX, cellY);
+
+                        // 如果是已揭示的数字格子（1-8）
+                        if (cellState > 0 && cellState < 9) {
+                            // 检查这个数字格子周围的情况
+                            const result = analyzeSurroundingCells(cellX, cellY, cellState);
+
+                            if (result.action) {
+                                //actions.push(result.action);
+                                actions[result.action.x + '.' + result.action.y] = result.action;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return actions;
+    }
+
+    // 分析周围格子的情况
+    function analyzeSurroundingCells(cellX, cellY, mineCount) {
+        let flaggedCount = 0;
+        let unrevealedCells = [];
+
+        // 遍历周围8个格子
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                if (dx === 0 && dy === 0) continue;
+
+                const x = cellX + dx;
+                const y = cellY + dy;
+
+                // 获取格子所在的区块
+                const chunkX = Math.floor(x / CHUNK_SIZE);
+                const chunkY = Math.floor(y / CHUNK_SIZE);
+                const localX = ((x % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+                const localY = ((y % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+
+                const chunkKey = `${chunkX},${chunkY}`;
+                let chunkData = state.game.chunks.get(chunkKey);
+
+                // 如果还没有加载区块数据，则尝试从localStorage加载
+                if (!chunkData) {
+                    chunkData = loadChunk(chunkKey);
+                }
+
+                // 获取格子状态
+                const cellState = getCellState(chunkData, localX, localY, x, y);
+
+                // 统计已标记的地雷数
+                if (cellState === -2 || cellState === -4) {
+                    flaggedCount++;
+                }
+                // 收集未揭示的格子
+                else if (cellState === -1 || cellState === -3) {
+                    unrevealedCells.push({x, y});
+                }
+            }
+        }
+
+        // 如果未标记的地雷数等于该数字，那么周围所有未揭示的格子都是安全的
+        if (flaggedCount === mineCount && unrevealedCells.length > 0) {
+            return {
+                action: {
+                    type: 'reveal',
+                    x: unrevealedCells[0].x,
+                    y: unrevealedCells[0].y
+                }
+            };
+        }
+
+        // 如果未揭示的格子数等于剩余需要标记的地雷数，那么这些格子都应该被标记
+        if (unrevealedCells.length > 0 && unrevealedCells.length === mineCount - flaggedCount) {
+            return {
+                action: {
+                    type: 'flag',
+                    x: unrevealedCells[0].x,
+                    y: unrevealedCells[0].y
+                }
+            };
+        }
+
+        // 没有确定的操作
+        return {action: null};
+    }
+
+    // 启动游戏
+    init();
+</script>
+</body>
+</html>
